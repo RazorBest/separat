@@ -1,0 +1,7 @@
+[project]
+name = "separat"
+version = "0.1.0"
+
+[project.scripts]
+separat = "separat.cli:main"
+watcher = "separat.watcher:main"
