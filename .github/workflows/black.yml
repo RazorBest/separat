@@ -1,0 +1,42 @@
+name: black
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "**.py"
+      - "pyproject.toml"
+      - ".github/workflows/black.yml"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "**.py"
+      - "pyproject.toml"
+      - ".github/workflows/black.yml"
+  workflow_dispatch: {}
+
+# Save CI minutes.
+concurrency:
+  group: black-${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  black:
+    name: black --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # Needs .python-version
+      - name: Install uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Check formatting
+        run: uv run --locked black --check --diff --color .
