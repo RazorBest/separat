@@ -1,24 +1,22 @@
 import json
-import sys
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import get_args, get_origin, Optional
+from typing import Optional, Union, get_args, get_origin
 
-
-STATE_FILE = Path(sys.path[0]) / "state.json"
-LOCAL_DATA = Path(sys.path[0]) / "data"
-SESSIONS_DIR = LOCAL_DATA / "sessions"
+from separat.storage import STATE_FILE, plasmaconf_dir, sessions_dir
 
 
 def dataclass_from_dict(cls, data):
     kwargs = {}
 
-    for field in fields(cls):
-        value = data[field.name]
-        field_type = field.type
+    for fld in fields(cls):
+        if not fld.init and fld.name not in data:
+            continue
+        value = data[fld.name]
+        field_type = fld.type
 
         if is_dataclass(field_type):
-            value = from_dict(field_type, value)
+            value = dataclass_from_dict(field_type, value)
         elif get_origin(field_type) is list:
             item_type = get_args(field_type)[0]
             if is_dataclass(item_type):
@@ -28,27 +26,47 @@ def dataclass_from_dict(cls, data):
             if is_dataclass(value_type):
                 value = {key: dataclass_from_dict(value_type, x) for key, x in value.items()}
 
-        kwargs[field.name] = value
+        kwargs[fld.name] = value
 
     return cls(**kwargs)
 
 
 @dataclass
 class ProfileData:
-    uuid: str
     name: str
     tmux_session_name: str
     firefox_profile: str
     firefox_pgid: Optional[int] = None
+    extra: dict = field(default_factory=dict)
+
+    def tmux_session_file(self) -> Path:
+        return sessions_dir(self.name) / self.tmux_session_name
+
+    def tmux_panes_file(self) -> Path:
+        return sessions_dir(self.name) / "pane_contents.tar.gz"
+
+    def plasmaconfig_file(self) -> Path:
+        return plasmaconf_dir(self.name) / "plasmaconfig"
+
+
+def default_profile() -> ProfileData:
+    profile = ProfileData(name="default", tmux_session_name="", firefox_profile="")
+    return profile
 
 
 @dataclass
 class AppState:
-    current_profile_uuid: Optional[str] = None
+    current_profile_name: Optional[str] = None
     profiles: dict[str, ProfileData] = field(default_factory=dict)
 
+    def __post_init__(self):
+        has_default = any(p.name == "default" for p in self.profiles.values())
+        if not has_default:
+            p = default_profile()
+            self.profiles[p.name] = p
+
     @classmethod
-    def load(cls, path: Optional[str | Path] = None) -> "AppState":
+    def load(cls, path: Optional[Union[str, Path]] = None) -> "AppState":
         if path is None:
             path = STATE_FILE
         path = Path(path)
@@ -60,7 +78,7 @@ class AppState:
             data = json.load(file)
             return dataclass_from_dict(cls, data)
 
-    def save(self, path: Optional[str | Path] = None):
+    def save(self, path: Optional[Union[str, Path]] = None) -> None:
         if path is None:
             path = STATE_FILE
         path = Path(path)
@@ -69,7 +87,24 @@ class AppState:
             json.dump(asdict(self), file, indent=2)
 
     def current_profile(self) -> ProfileData:
-        return self.profiles[self.current_profile_uuid]
+        if self.current_profile_name is None:
+            raise RuntimeError("No active current profile")
+        return self.profiles[self.current_profile_name]
 
     def profile_by_name(self, name: str) -> Optional[ProfileData]:
-        return next((p for p in self.profiles.values() if p.name == name), None)
+        return self.profiles.get(name, None)
+
+    def default_profile(self) -> ProfileData:
+        return self.profiles["default"]
+
+    def add_profile(self, profile: ProfileData):
+        if profile.name in self.profiles:
+            raise RuntimeError(f"Profile '{profile.name}' already exists")
+        self.profiles[profile.name] = profile
+
+    def set_current_profile(self, name: str) -> ProfileData:
+        if (profile := self.profiles.get(name, None)) is None:
+            raise RuntimeError(f"Profile '{name}' doesn't exist")
+        self.current_profile_name = name
+
+        return profile

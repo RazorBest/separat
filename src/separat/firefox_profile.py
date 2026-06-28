@@ -2,31 +2,26 @@ from __future__ import annotations
 
 import configparser
 import html
-import json
 import os
-import subprocess
 import shutil
 import sqlite3
+import subprocess
 import tempfile
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
-
 
 from separat.util import copy_to_temp
 
-
 themes = {
-        "Frostlit": "{74da71cc-4d66-48f5-95d1-1f017f18ffab}",
-        "Blue & Yellow": "{b2e6a461-610a-4882-8329-9ebc7164115b}",
-        "Magical aristocracy": "{32965c32-d2e9-4b17-b9e4-c52b26f9ed08}",
-        "Activist – Balanced": "activist-balanced-colorway@mozilla.org",
-        "Visionary – Balanced": "visionary-balanced-colorway@mozilla.org",
-        "Innovator – Balanced": "innovator-balanced-colorway@mozilla.org",
-        "Dream of Waves": "{a07400bb-b55c-4435-906d-5b6d8303f4c1}",
-        "Crocus flowerses Easter": "{c66a6c92-ee14-48fc-8814-93ed174f42d1}",
-        "Senzune Fractal Luster": "{9904367c-ae9c-4b2d-b0ad-85e676269497}",
+    "Frostlit": "{74da71cc-4d66-48f5-95d1-1f017f18ffab}",
+    "Blue & Yellow": "{b2e6a461-610a-4882-8329-9ebc7164115b}",
+    "Magical aristocracy": "{32965c32-d2e9-4b17-b9e4-c52b26f9ed08}",
+    "Activist – Balanced": "activist-balanced-colorway@mozilla.org",
+    "Visionary – Balanced": "visionary-balanced-colorway@mozilla.org",
+    "Innovator – Balanced": "innovator-balanced-colorway@mozilla.org",
+    "Dream of Waves": "{a07400bb-b55c-4435-906d-5b6d8303f4c1}",
+    "Crocus flowerses Easter": "{c66a6c92-ee14-48fc-8814-93ed174f42d1}",
+    "Senzune Fractal Luster": "{9904367c-ae9c-4b2d-b0ad-85e676269497}",
 }
 
 
@@ -45,9 +40,16 @@ COPY_FROM_PROFILE = [
 ]
 
 
-def run(cmd: str):
-    p = subprocess.run(cmd, shell="True", capture_output=True, check=True, text=True)
+class FirefoxProfileError(Exception):
+    pass
 
+
+class ProfileAlreadyExists(FirefoxProfileError):
+    pass
+
+
+def run(cmd: str):
+    p = subprocess.run(cmd, shell=True, capture_output=True, check=True, text=True)
     return p.stdout
 
 
@@ -65,6 +67,9 @@ def get_default_profile_path() -> Path:
                 default_profile_file = line.split("Default=")[1].strip()
                 break
 
+    if default_profile_file is None:
+        raise RuntimeError("Couldn't find default profile path")
+
     default_profile_path = FIREFOX_DIR / default_profile_file
 
     return Path(default_profile_path)
@@ -72,6 +77,8 @@ def get_default_profile_path() -> Path:
 
 @dataclass
 class Bookmark:
+    """A bookmark as it's represented in the sql database of firefox."""
+
     guid: str = ""
     title: str = ""
     index: int = 0
@@ -80,9 +87,9 @@ class Bookmark:
     id_: int = 0
     typeCode: int = -1
     type_: str = field(init=False)
-    root: Optional[str] = field(init=False)
+    root: str | None = field(init=False)
     children: list[Bookmark] = field(default_factory=list)
-    uri: Optional[str] = None
+    uri: str | None = None
 
     def __post_init__(self):
         if self.typeCode == 1:
@@ -117,9 +124,7 @@ class Bookmark:
             "index": self.index,
             "dateAdded": self.dateAdded,
             "lastModified": self.lastModified,
-            "id": self.id_,
             "typeCode": self.typeCode,
-            "type": self.type_,
         }
 
         if self.root is not None:
@@ -165,7 +170,8 @@ def read_bookmarks(profile_path: str | Path) -> Bookmark:
         syncChangeCounter INTEGER NOT NULL DEFAULT 1
     );
     """
-    cursor.execute("""
+    cursor.execute(
+        """
         SELECT
             moz_bookmarks.id,
             moz_bookmarks.type,
@@ -188,14 +194,15 @@ def read_bookmarks(profile_path: str | Path) -> Bookmark:
         WHERE
             moz_bookmarks.title IS NOT NULL
         ;
-    """)
+    """
+    )
     rows = cursor.fetchall()
     conn.close()
 
-    parents = {}
+    parents: dict[int, Bookmark] = {}
     for line in rows:
-        (book_id, typeCode, parent, position, title,
-         dateAdded, lastModified, guid, uri) = line
+        (book_id, typeCode, parent, position, title, dateAdded, lastModified, guid, uri) = line
+        assert type(book_id) is int
 
         bookmark = None
         bookmark = Bookmark(
@@ -222,7 +229,7 @@ def read_bookmarks(profile_path: str | Path) -> Bookmark:
                 bparent = Bookmark()
                 bparent.id_ = parent
                 parents[parent] = bparent
-        
+
             parents[parent].children.append(bookmark)
 
     # Return the root
@@ -232,7 +239,7 @@ def read_bookmarks(profile_path: str | Path) -> Bookmark:
 def parse_bookmark_node_to_html(node: Bookmark):
     lines = []
     title = html.escape(node.title)
-    
+
     # Convert Firefox microseconds timestamps to standard Unix seconds
     add_date = node.dateAdded // 1000000
     last_mod = node.lastModified // 1000000
@@ -248,18 +255,20 @@ def parse_bookmark_node_to_html(node: Bookmark):
         if node.root not in ("placesRoot", "bookmarksMenuFolder", "toolbarFolder", "unfiledBookmarksFolder", "mobileFolder"):
             lines.append(f'    <DT><H3 ADD_DATE="{add_date}" LAST_MODIFIED="{last_mod}">{title}</H3>\n')
         lines.append("    <DL><p>\n")
-        
+
         # Recursively process everything inside this folder
         for child in node.children:
             # Indent child elements for clean HTML readability
             child_html = parse_bookmark_node_to_html(child)
             indented_child = "\n".join([f"    {line}" if line else "" for line in child_html.split("\n")])
             lines.append(indented_child.rstrip() + "\n")
-            
+
         lines.append("    </DL><p>\n")
 
     # Bookmarks (typeCode 1)
     elif node.typeCode == 1:
+        if node.uri is None:
+            raise RuntimeError("Uri can't be None when typeCode == 1")
         uri = html.escape(node.uri)
         lines.append(f'    <DT><A HREF="{uri}" ADD_DATE="{add_date}">{title}</A>\n')
 
@@ -270,7 +279,7 @@ def parse_bookmark_node_to_html(node: Bookmark):
     return "".join(lines)
 
 
-def export_bookmarks_to_html_tempfile(profile_path: str | Path):
+def export_bookmarks_to_html_tempfile(profile_path: str | Path) -> tempfile._TemporaryFileWrapper:
     bookmark_root = read_bookmarks(profile_path)
 
     # Classic Netscape bookmark header that Firefox requires to trigger import
@@ -282,7 +291,7 @@ def export_bookmarks_to_html_tempfile(profile_path: str | Path):
         "<H1>Bookmarks</H1>\n\n"
         "<DL><p>\n"
     )
-    
+
     html_body = parse_bookmark_node_to_html(bookmark_root)
     html_footer = "</DL><p>\n"
 
@@ -294,17 +303,22 @@ def export_bookmarks_to_html_tempfile(profile_path: str | Path):
     return tmpfile
 
 
-def create_profile(name: str):
+def create_profile(name: str) -> None:
     default_profile_path = get_default_profile_path()
-    assert(default_profile_path is not None)
+    assert default_profile_path is not None
 
-    out = run(f"firefox -CreateProfile {name}")
     profile_dir = get_profile_path_with_name(name)
-    assert(profile_dir is not None)
+    # Profile already exists before creation
+    if profile_dir is not None:
+        raise ProfileAlreadyExists(f"Firefox profile {name} already exists in {profile_dir}")
 
-    for file in COPY_FROM_PROFILE:
-        src = default_profile_path / file
-        dst = os.path.join(profile_dir, file)
+    run(f"firefox -CreateProfile {name}")
+    profile_dir = get_profile_path_with_name(name)
+    assert profile_dir is not None
+
+    for filename in COPY_FROM_PROFILE:
+        src = default_profile_path / filename
+        dst = profile_dir / filename
 
         if os.path.isfile(src):
             shutil.copy2(src, dst)
@@ -321,17 +335,17 @@ def create_profile(name: str):
         file.write(Path(bookmarks_html_file.name).read_bytes())
 
     # Configure user.js such that it imports the bookmarks
-    suffix = f'''
+    suffix = f"""
     user_pref("browser.places.importBookmarksHTML", true);
     user_pref("browser.bookmarks.file", "{bookmarks_profile_path.resolve()}");
-    '''
+    """
 
     user_js_path = profile_dir / "user.js"
     with user_js_path.open("w+") as file:
         file.write(suffix)
 
 
-def get_profile_path_with_name(name: str) -> Optional[str]:
+def get_profile_path_with_name(name: str) -> Path | None:
     firefox_profiles_ini = FIREFOX_DIR / "profiles.ini"
     profile_file = None
     with open(firefox_profiles_ini) as file:
@@ -344,7 +358,7 @@ def get_profile_path_with_name(name: str) -> Optional[str]:
                 profile_section = False
             elif profile_section and line.startswith(f"Name={name}"):
                 has_name = True
-            elif profile_section and has_name and line.startswith(f"Path="):
+            elif profile_section and has_name and line.startswith("Path="):
                 profile_file = line.split("Path=")[1].strip()
                 break
 
@@ -354,8 +368,10 @@ def get_profile_path_with_name(name: str) -> Optional[str]:
     return FIREFOX_DIR / profile_file
 
 
-def remove_profile(name: str):
+def remove_profile(name: str) -> bool:
     profile_dir = get_profile_path_with_name(name)
+    if profile_dir is None:
+        raise RuntimeError(f"Can't find directory of profile '{name}'")
     # Remove the profile directory
     shutil.rmtree(profile_dir)
 
@@ -363,7 +379,8 @@ def remove_profile(name: str):
 
     # Read
     conf = configparser.RawConfigParser()
-    conf.optionxform = str
+    # Preserves casing
+    conf.optionxform = str  # type: ignore[method-assign,assignment]
     firefox_profiles_ini = FIREFOX_DIR / "profiles.ini"
     conf.read(firefox_profiles_ini)
 
@@ -379,13 +396,7 @@ def remove_profile(name: str):
     return True
 
 
-def update_theme():
-    "prefs.js"
-
-    user_pref("extensions.activeThemeID", "{74da71cc-4d66-48f5-95d1-1f017f18ffab}");
-
-
-def start_with_profile(name: str):
+def start_with_profile(name: str) -> subprocess.Popen:
     return subprocess.Popen(
         ["firefox", "-P", name],
         stdin=None,
