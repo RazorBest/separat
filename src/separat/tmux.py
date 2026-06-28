@@ -70,6 +70,7 @@ def sync_panes_with_session(profile_panels_file: Union[str, Path], session_name:
         dst.addfile(member, file)
 
     dst.close()
+    profile_panels_file.parent.mkdir(parents=True, exist_ok=True)
     os.rename(tmpcopy2.name, profile_panels_file)
 
 
