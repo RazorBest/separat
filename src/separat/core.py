@@ -162,6 +162,9 @@ def launch_profile(state: AppState, name: str) -> None:
         tmux_manager.start_tmux_session(rand_session)
         resurrect_restore_tmux()
         stop_tmux_session(rand_session)
+        # If there was no previous storted session, it will not be restored.
+        # In that case, start it for the first time. If it's already stored, nothing happens.
+        tmux_manager.start_tmux_session(profile.tmux_session_name)
     finally:
         tmux_manager.enable_continuum()
 
