@@ -2,6 +2,12 @@
 
 Organize your work into workspaces: a Firefox profile, a tmux session and a Desktop. Keep them after restart and resume your work with minimal friction.
 
+## Dependencies
+
+- For tmux, you need `tmux-resurrect`. You can also use `tmux-continuum` (an addition to `tmux-resurrect`), but it's not mandatory. Separat triggers resurrect whenever you call `separat stop`.
+- You will need a KDE desktop.
+- Firefox
+
 ## Installation
 
 Separat ships with a CLI. Since most Linux distros noew enforce externally managed environments, you will need to install this module under an environment.
