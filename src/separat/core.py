@@ -4,12 +4,14 @@ import random
 import shutil
 import signal
 import string
+import subprocess
 import tarfile
 import time
 from pathlib import Path
 from typing import Union
 
 import separat.firefox_profile as firefox
+import separat.tmux as tmux
 from separat.plasma_config import (
     export_plasma_desktops_config,
     replace_plasma_desktops_config,
@@ -22,7 +24,6 @@ from separat.tmux import (
     TmuxManager,
     remove_session_from_panes,
     remove_session_from_resurrect,
-    resurrect_restore_tmux,
     stop_tmux_session,
     sync_panes_with_session,
     sync_resurrect_with_session,
@@ -141,17 +142,7 @@ def store_default_plasmaconfig(state: AppState, plasma_config: dict) -> None:
     store_plasmaconfig_for_profile(profile, plasma_config)
 
 
-def launch_profile(state: AppState, name: str) -> None:
-    if state.current_profile_name is not None:
-        raise ValueError("A different profile is active")
-
-    profile = set_active_profile(state, name)
-
-    # Firefox
-    proc = firefox.start_with_profile(profile.firefox_profile)
-    set_current_profile_firefox_pgid(state, proc.pid)
-
-    # Tmux
+def launch_tmux_profile(profile: ProfileData) -> None:
     tmux_manager = TmuxManager()
     tmux_manager.disable_continuum()
     try:
@@ -160,20 +151,33 @@ def launch_profile(state: AppState, name: str) -> None:
         # Use a dummy session to be able to run resurrect
         # We should use the profile session, because the contents of existing panes are not restored
         tmux_manager.start_tmux_session(rand_session)
-        resurrect_restore_tmux()
+        tmux_manager.resurrect_restore_tmux()
         stop_tmux_session(rand_session)
         # If there was no previous storted session, it will not be restored.
         # In that case, start it for the first time. If it's already stored, nothing happens.
-        tmux_manager.start_tmux_session(profile.tmux_session_name)
+        try:
+            tmux_manager.start_tmux_session(profile.tmux_session_name)
+        except subprocess.CalledProcessError:
+            # Session already exists
+            pass
+
+        for option_name, value in profile.tmux_options():
+            tmux.set_option(profile.tmux_session_name, option_name, value)
     finally:
         tmux_manager.enable_continuum()
+
+
+def launch_profile(state: AppState, name: str) -> None:
+    if state.current_profile_name is not None:
+        raise ValueError("A different profile is active")
+
+    profile = set_active_profile(state, name)
 
     # WARNING: The plasma config file is changed when we change the desktop.
     # That's why we have to save it before changing the Desktop.
     # Plasma state
     default_plasmaconfig = export_plasma_desktops_config()
     store_default_plasmaconfig(state, default_plasmaconfig)
-    # restart_plasma()
 
     # Desktop directory
     if (prev_desktop := get_current_desktop()) != "":
@@ -183,6 +187,52 @@ def launch_profile(state: AppState, name: str) -> None:
     time.sleep(0.5)
     replace_plasmaconfig_from_profile(profile)
     restart_plasma()
+
+    # Firefox
+    proc = firefox.start_with_profile(profile.firefox_profile)
+    set_current_profile_firefox_pgid(state, proc.pid)
+
+    launch_tmux_profile(profile)
+
+
+def save_tmux_state(state: AppState, name: str):
+    if (profile := state.profile_by_name(name)) is None:
+        raise RuntimeError(f"Profile {name} doesn't exist")
+    tmux_session_name = profile.tmux_session_name
+    sync_resurrect_with_session(profile.tmux_session_file(), tmux_session_name)
+    sync_panes_with_session(profile.tmux_panes_file(), tmux_session_name)
+
+    options = [
+        "bell-action",
+        "clock-mode-colour",
+        "message-style",
+        "monitor-activity",
+        "pane-border-style",
+        "pane-active-border-style",
+        "status-position",
+        "status-justify",
+        "status-left",
+        "status-left-length",
+        "status-right",
+        "status-right-style",
+        "status-right-length",
+        "status-bg",
+        "status-fg",
+        "visual-activity",
+        "visual-bell",
+        "visual-silence",
+    ]
+    try:
+        for option in options:
+            val = tmux.get_option(tmux_session_name, option)
+            if val is None:
+                continue
+            profile.set_tmux_option(option, val)
+    # No such session
+    except RuntimeError:
+        pass
+
+    state.save()
 
 
 def stop_profile(state: AppState) -> None:
@@ -195,11 +245,10 @@ def stop_profile(state: AppState) -> None:
         pass
     profile.firefox_pgid = None
 
-    tmux_session_name = profile.tmux_session_name
-    sync_resurrect_with_session(profile.tmux_session_file(), tmux_session_name)
-    sync_panes_with_session(profile.tmux_panes_file(), tmux_session_name)
-    remove_session_from_resurrect(tmux_session_name)
-    remove_session_from_panes(tmux_session_name)
+    save_tmux_state(state, profile.name)
+
+    remove_session_from_resurrect(profile.tmux_session_name)
+    remove_session_from_panes(profile.tmux_session_name)
 
     # WARNING: The plasma config file is changed when we change the desktop.
     # That's why we have to save it before changing the Desktop.
@@ -219,40 +268,19 @@ def stop_profile(state: AppState) -> None:
     state.save()
 
     # This can stop this process if it was launched from the tmux session that we're about to kill
-    stop_tmux_session(tmux_session_name)
+    try:
+        stop_tmux_session(profile.tmux_session_name)
+    except subprocess.CalledProcessError as exc:
+        print(exc)
+        pass
 
 
-def switch_profile(state: AppState, name: str) -> None:
+def switch_profile(state: AppState, name: str) -> list[str]:
     old_profile = state.current_profile()
     old_tmux_session = old_profile.tmux_session_name
     if (new_profile := state.profile_by_name(name)) is None:
         raise RuntimeError("Profile {name} doesn't exist")
     new_tmux_session = new_profile.tmux_session_name
-
-    # Firefox
-    try:
-        if old_profile.firefox_pgid is not None:
-            os.killpg(old_profile.firefox_pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    old_profile.firefox_pgid = None
-    proc = firefox.start_with_profile(new_profile.firefox_profile)
-
-    # Tmux
-    tmux_manager = TmuxManager()
-    tmux_manager.disable_continuum()
-    try:
-        sync_resurrect_with_session(old_profile.tmux_session_file(), old_tmux_session)
-        remove_session_from_resurrect(old_tmux_session)
-        sync_panes_with_session(old_profile.tmux_panes_file(), old_tmux_session)
-        remove_session_from_panes(old_tmux_session)
-
-        merge_saved_profile_with_resurrect(new_profile, new_tmux_session)
-
-        resurrect_restore_tmux()
-        stop_tmux_session(old_tmux_session)
-    finally:
-        tmux_manager.enable_continuum()
 
     # WARNING: The plasma config file is changed when we change the desktop.
     # That's why we have to save it before changing the Desktop.
@@ -274,12 +302,48 @@ def switch_profile(state: AppState, name: str) -> None:
     replace_plasmaconfig_from_profile(new_profile)
     restart_plasma()
 
+    # Firefox
+    try:
+        if old_profile.firefox_pgid is not None:
+            os.killpg(old_profile.firefox_pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    old_profile.firefox_pgid = None
+    proc = firefox.start_with_profile(new_profile.firefox_profile)
+
+    # Tmux
+    clients = []
+    tmux_manager = TmuxManager()
+    tmux_manager.disable_continuum()
+    try:
+        save_tmux_state(state, old_profile.name)
+        remove_session_from_resurrect(old_tmux_session)
+        remove_session_from_panes(old_tmux_session)
+
+        merge_saved_profile_with_resurrect(new_profile, new_tmux_session)
+
+        tmux_manager.resurrect_restore_tmux()
+
+        for option_name, value in new_profile.tmux_options():
+            tmux.set_option(new_profile.tmux_session_name, option_name, value)
+
+        clients = tmux_manager.clients_switch_to_session(old_tmux_session, new_tmux_session)
+    finally:
+        tmux_manager.enable_continuum()
+
     state.current_profile_name = None
 
     set_active_profile(state, name)
     set_current_profile_firefox_pgid(state, proc.pid)
 
     state.save()
+
+    try:
+        stop_tmux_session(old_tmux_session)
+    except subprocess.CalledProcessError:
+        pass
+
+    return clients
 
 
 def exec_into_tmux_current_session(state: AppState) -> None:

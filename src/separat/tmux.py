@@ -1,6 +1,11 @@
 import os
+import pty
+import random
+import signal
+import string
 import subprocess
 import tarfile
+import time
 from pathlib import Path
 from typing import Optional, Union
 
@@ -14,10 +19,38 @@ DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share
 TMUX_RESSURECT_DIR = DATA_HOME / "tmux" / "resurrect"
 
 
-def run_tmux(args: list[str]) -> str:
-    p = subprocess.run(["tmux", *args], capture_output=True, check=True, text=True)
+def run_tmux(tmux_args: list[str], **kwargs) -> str:
+    p = subprocess.run(["tmux", *tmux_args], capture_output=True, check=True, text=True, **kwargs)
 
     return p.stdout
+
+
+def get_option(session_name: str, option: str) -> Optional[str]:
+    try:
+        output = run_tmux(["show-options", "-v", "-t", session_name, option])
+        output = output.removesuffix("\n")
+        if output == "":
+            return None
+        return output
+    except subprocess.CalledProcessError as exc:
+        if "invalid option" in exc.stderr:
+            raise RuntimeError(f"Invalid option: {option}") from exc
+        elif "no such session" in exc.stderr:
+            raise RuntimeError(f"No such session: {session_name}") from exc
+
+        raise exc
+
+
+def set_option(session_name: str, option: str, value: str):
+    try:
+        run_tmux(["set-option", "-t", session_name, option, value])
+    except subprocess.CalledProcessError as exc:
+        if "invalid option" in exc.stderr:
+            raise RuntimeError(f"Invalid option: {option}") from exc
+        elif "no such session" in exc.stderr:
+            raise RuntimeError(f"No such session: {session_name}") from exc
+
+        raise exc
 
 
 def remove_session_from_panes(session_name: str) -> None:
@@ -98,6 +131,8 @@ class TmuxManager:
             output = run_tmux(["show-options", "-g", "@continuum-save-interval"])
             value = output.strip().split(" ")[1]
             if value == "0":
+                if self.local_continuum_enabled is not False:
+                    self.continuum_save_interval = "0"
                 return None
 
             self.continuum_save_interval = value
@@ -130,46 +165,63 @@ class TmuxManager:
         if not self.local_continuum_enabled:
             self.disable_continuum()
 
-    def replace_tmux_session(self, old_session: str, new_session: str) -> None:
-        # Create detached new session
-        self.start_tmux_session(new_session)
-
+    def clients_switch_to_session(self, old_session: str, new_session: str) -> list[str]:
         # Switch all the clients to the new session
-        output = run_tmux(["list-clients", "-t", old_session])
+        output = run_tmux(["list-clients", "-t", old_session, "-F", "#{client_name}"])
         lines = output.strip().split("\n")
-        ptys = [line.split(" ")[0] for line in lines]
-        for pty in ptys:
-            run_tmux(["switch-client", "-c", pty, "-t", new_session])
+        ptys = [line.strip() for line in lines if line.strip() != ""]
+        for pty_path in ptys:
+            run_tmux(["switch-client", "-c", pty_path, "-t", new_session])
 
-        stop_tmux_session(old_session)
+        return ptys
+
+    def resurrect_restore_tmux(self) -> None:
+        output = run_tmux(["list-keys"])
+
+        lines = output.strip().split("\n")
+        restore_script_path = None
+        for line in lines:
+            if "tmux-resurrect/scripts/restore.sh" not in line:
+                continue
+
+            words = line.strip().split()
+            restore_script_path = words[5]
+            if "tmux-resurrect/scripts/restore.sh" not in restore_script_path:
+                raise RuntimeError("Restore command has an unexpected format")
+            break
+
+        if restore_script_path is None:
+            raise RuntimeError("Can't find the restore command. Is resurrect installed?")
+
+        rand_session = "".join(random.choices(string.ascii_letters, k=16))
+        self.start_tmux_session(rand_session)
+
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp("tmux", ["tmux", "attach-session", "-t", rand_session])
+
+        # Wait for the client to attach
+        time.sleep(0.2)
+
+        client_name = run_tmux(["list-clients", "-t", rand_session, "-F", "#{client_name}"]).strip()
+        # Ensure that this is the last client
+        run_tmux(["lock-client", "-t", client_name])
+
+        # Do the actual restore
+        run_tmux(["run-shell", restore_script_path])
+
+        # The client should've switched. Detach it from whatever session it was switched to.
+        run_tmux(["detach-client", "-t", client_name])
+        stop_tmux_session(rand_session)
+
+        os.kill(pid, signal.SIGTERM)
 
 
 def stop_tmux_session(session: str) -> Optional[str]:
     try:
         return run_tmux(["kill-session", "-t", session])
     except subprocess.CalledProcessError:
-        return None
-
-
-def resurrect_restore_tmux() -> None:
-    output = run_tmux(["list-keys"])
-
-    lines = output.strip().split("\n")
-    restore_script_path = None
-    for line in lines:
-        if "tmux-resurrect/scripts/restore.sh" not in line:
-            continue
-
-        words = line.strip().split()
-        restore_script_path = words[5]
-        if "tmux-resurrect/scripts/restore.sh" not in restore_script_path:
-            raise RuntimeError("Restore command has an unexpected format")
-        break
-
-    if restore_script_path is None:
-        raise RuntimeError("Can't find the restore command. Is resurrect installed?")
-
-    run_tmux(["run-shell", restore_script_path])
+        raise
 
 
 def already_in_tmux_environment() -> bool:

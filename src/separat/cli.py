@@ -65,7 +65,9 @@ def do_switch(workspace: str) -> int:
         if curr.name == workspace:
             print(f"Workspace {workspace} is already active")
             return 0
-        switch_profile(state, workspace)
+        clients = switch_profile(state, workspace)
+        if clients == []:
+            exec_into_tmux_current_session(state)
     elif not already_in_tmux_environment():
         launch_profile(state, workspace)
         # This doens't return
